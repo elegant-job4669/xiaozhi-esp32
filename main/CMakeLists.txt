@@ -92,7 +92,6 @@ if(CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI)
     set(BOARD_TYPE "bread-compact-wifi")
     set(BUILTIN_TEXT_FONT font_puhui_basic_14_1)
     set(BUILTIN_ICON_FONT font_awesome_14_1)
-    set(DEFAULT_EMOJI_COLLECTION twemoji_64)
 elseif(CONFIG_BOARD_TYPE_BREAD_COMPACT_ML307)
     set(BOARD_TYPE "bread-compact-ml307")
     set(BUILTIN_TEXT_FONT font_puhui_basic_14_1)
@@ -1042,6 +1041,14 @@ if(CONFIG_BOARD_TYPE_ESP_VOCAT)
     list(APPEND MAIN_PRIV_REQUIRES_EXTRA
         espressif__touch_slider_sensor
         espressif__touch_button_sensor
+    )
+endif()
+
+if(CONFIG_OLED_ASCII_FACE_128X64)
+    file(GLOB OLED_EMOJI_IMAGE_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/display/oled_emoji/c/*.c)
+    list(APPEND SOURCES
+        display/oled_emoji/oled_emoji_collection.cc
+        ${OLED_EMOJI_IMAGE_SOURCES}
     )
 endif()
 
