@@ -3,6 +3,7 @@
 #include "lvgl_theme.h"
 #include "lvgl_font.h"
 #include "display/lvgl_display/emoji_collection.h"
+#include "display/oled_emoji/oled_emoji_collection.h"
 #include "application.h"
 #include "device_state.h"
 
@@ -36,7 +37,7 @@ OledDisplay::OledDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handl
     dark_theme->set_icon_font(icon_font);
     dark_theme->set_large_icon_font(large_icon_font);
 #if CONFIG_OLED_ASCII_FACE_128X64
-    dark_theme->set_emoji_collection(std::make_shared<Twemoji64>());
+    dark_theme->set_emoji_collection(std::make_shared<OledMonochromeEmoji64>());
 #endif
 
     auto& theme_manager = LvglThemeManager::GetInstance();
