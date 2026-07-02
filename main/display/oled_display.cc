@@ -2,9 +2,12 @@
 #include "assets/lang_config.h"
 #include "lvgl_theme.h"
 #include "lvgl_font.h"
+#include "application.h"
+#include "device_state.h"
 
 #include <string>
 #include <algorithm>
+#include <cstring>
 
 #include <esp_log.h>
 #include <esp_err.h>
@@ -89,13 +92,21 @@ void OledDisplay::SetupUI() {
     
     Display::SetupUI();  // Mark SetupUI as called
     if (height_ == 64) {
+#if CONFIG_OLED_ASCII_FACE_128X64
+        SetupUI_128x64_AsciiFace();
+#else
         SetupUI_128x64();
+#endif
     } else {
         SetupUI_128x32();
     }
 }
 
 OledDisplay::~OledDisplay() {
+#if CONFIG_OLED_ASCII_FACE_128X64
+    StopFaceAnimation();
+#endif
+
     if (content_ != nullptr) {
         lv_obj_del(content_);
     }
@@ -144,6 +155,11 @@ void OledDisplay::Unlock() {
 }
 
 void OledDisplay::SetChatMessage(const char* role, const char* content) {
+#if CONFIG_OLED_ASCII_FACE_128X64
+    (void)role;
+    (void)content;
+    return;
+#endif
     DisplayLockGuard lock(this);
     if (chat_message_label_ == nullptr) {
         return;
@@ -164,6 +180,246 @@ void OledDisplay::SetChatMessage(const char* role, const char* content) {
         }
     }
 }
+
+#if CONFIG_OLED_ASCII_FACE_128X64
+
+struct AsciiFace {
+    const char* line1;
+    const char* line2;
+    const char* line3;
+};
+
+static std::string FormatAsciiFace(const AsciiFace& face) {
+    std::string text;
+    text.reserve(32);
+    text.append(face.line1);
+    text.push_back('\n');
+    text.append(face.line2);
+    text.push_back('\n');
+    text.append(face.line3);
+    return text;
+}
+
+static const AsciiFace* LookupEmotionFace(const char* emotion) {
+    static const struct {
+        const char* name;
+        AsciiFace face;
+    } kEmotionFaces[] = {
+        {"neutral",     {"  o   o", "    -", "  -----"}},
+        {"happy",       {"  ^   ^", "    -", "  \\___/"}},
+        {"laughing",    {"  *   *", "    -", "  \\___/"}},
+        {"funny",       {"  ^   ^", "    o", "  ~___~"}},
+        {"sad",         {"  >   <", "    -", "  -----"}},
+        {"angry",       {"  >   <", "    -", "  \\___/"}},
+        {"crying",      {"  T   T", "    -", "  \\___/"}},
+        {"loving",      {"  *   *", "    -", "    <3"}},
+        {"embarrassed", {"  @   @", "    -", "  -----"}},
+        {"surprised",   {"  O   O", "    o", "    O"}},
+        {"shocked",     {"  O   O", "    O", "    O"}},
+        {"thinking",    {"  o   .", "    -", "  -----"}},
+        {"winking",     {"  ^   o", "    -", "  -----"}},
+        {"cool",        {"  o   o", "   ---", "  -----"}},
+        {"relaxed",     {"  -   -", "    -", "  -----"}},
+        {"delicious",   {"  ^   ^", "    -", "    U"}},
+        {"kissy",       {"  *   *", "    -", "    *"}},
+        {"confident",   {"  >   <", "    -", "  \\___/"}},
+        {"sleepy",      {"  -   -", "    z", "  -----"}},
+        {"silly",       {"  ^   o", "    -", "  \\___/"}},
+        {"confused",    {"  ?   ?", "    -", "  -----"}},
+        {"microchip_ai",{"  [#] [#]", "    -", "  -----"}},
+        {"link",        {"  o   o", "    -", "  --o--"}},
+        {"triangle_exclamation", {"  X   X", "    !", "  -----"}},
+        {"circle_xmark",{"  X   X", "    !", "  -----"}},
+        {"cloud_slash", {"  >   <", "    -", "  -----"}},
+        {"cloud_arrow_down", {"  o   o", "    .", "  . . ."}},
+    };
+
+    if (emotion == nullptr) {
+        return nullptr;
+    }
+    for (const auto& item : kEmotionFaces) {
+        if (strcmp(emotion, item.name) == 0) {
+            return &item.face;
+        }
+    }
+    return nullptr;
+}
+
+static const AsciiFace kNeutralFace = {"  o   o", "    -", "  -----"};
+static const AsciiFace kErrorFace = {"  X   X", "    !", "  -----"};
+
+static const AsciiFace* GetStateOverlayFace(DeviceState state, int anim_frame) {
+    switch (state) {
+        case kDeviceStateListening: {
+            static const AsciiFace frames[] = {
+                {"  ^   ^", "    o", "  -----"},
+                {"  -   -", "    o", "  -----"},
+            };
+            return &frames[anim_frame % 2];
+        }
+        case kDeviceStateConnecting: {
+            static const AsciiFace frames[] = {
+                {"  .   .", "    o", "  . . ."},
+                {"  o   o", "    -", "  . . ."},
+            };
+            return &frames[anim_frame % 2];
+        }
+        case kDeviceStateSpeaking: {
+            static const AsciiFace frames[] = {
+                {"  o   o", "    O", "  -----"},
+                {"  o   o", "    o", "  -----"},
+            };
+            return &frames[anim_frame % 2];
+        }
+        case kDeviceStateStarting:
+        case kDeviceStateActivating:
+        case kDeviceStateUpgrading:
+        case kDeviceStateAudioTesting: {
+            static const AsciiFace frames[] = {
+                {"  o   o", "    .", "  . . ."},
+                {"  o   o", "    .", "  .. .."},
+                {"  o   o", "    .", "  ..."}},
+            };
+            return &frames[anim_frame % 3];
+        }
+        case kDeviceStateFatalError:
+            return &kErrorFace;
+        default:
+            return nullptr;
+    }
+}
+
+static bool StateNeedsAnimation(DeviceState state) {
+    switch (state) {
+        case kDeviceStateListening:
+        case kDeviceStateConnecting:
+        case kDeviceStateSpeaking:
+        case kDeviceStateStarting:
+        case kDeviceStateActivating:
+        case kDeviceStateUpgrading:
+        case kDeviceStateAudioTesting:
+            return true;
+        default:
+            return false;
+    }
+}
+
+void OledDisplay::FaceAnimTimerCallback(void* arg) {
+    auto* display = static_cast<OledDisplay*>(arg);
+    display->face_anim_frame_++;
+    if (!display->Lock(0)) {
+        return;
+    }
+    display->RenderAsciiFaceUnlocked();
+    display->Unlock();
+}
+
+void OledDisplay::StartFaceAnimation() {
+    if (face_anim_timer_ == nullptr) {
+        esp_timer_create_args_t timer_args = {
+            .callback = FaceAnimTimerCallback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "ascii_face_anim",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &face_anim_timer_));
+    }
+    esp_timer_stop(face_anim_timer_);
+    ESP_ERROR_CHECK(esp_timer_start_periodic(face_anim_timer_, 500000));
+}
+
+void OledDisplay::StopFaceAnimation() {
+    if (face_anim_timer_ != nullptr) {
+        esp_timer_stop(face_anim_timer_);
+        esp_timer_delete(face_anim_timer_);
+        face_anim_timer_ = nullptr;
+    }
+    face_anim_frame_ = 0;
+}
+
+void OledDisplay::SetupUI_128x64_AsciiFace() {
+    DisplayLockGuard lock(this);
+
+    auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+    auto text_font = lvgl_theme->text_font()->font();
+
+    auto screen = lv_screen_active();
+    lv_obj_set_style_text_font(screen, text_font, 0);
+    lv_obj_set_style_text_color(screen, lv_color_black(), 0);
+
+    container_ = lv_obj_create(screen);
+    lv_obj_set_size(container_, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_pad_all(container_, 0, 0);
+    lv_obj_set_style_border_width(container_, 0, 0);
+    lv_obj_set_style_radius(container_, 0, 0);
+    lv_obj_set_style_bg_opa(container_, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(container_, LV_OBJ_FLAG_SCROLLABLE);
+
+    face_label_ = lv_label_create(container_);
+    lv_obj_set_width(face_label_, LV_HOR_RES);
+    lv_obj_set_style_text_align(face_label_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_line_space(face_label_, 2, 0);
+    lv_obj_center(face_label_);
+    lv_label_set_text(face_label_, "");
+
+    current_emotion_ = "neutral";
+    RenderAsciiFaceUnlocked();
+}
+
+void OledDisplay::RenderAsciiFaceUnlocked() {
+    if (face_label_ == nullptr) {
+        return;
+    }
+
+    const AsciiFace* face = nullptr;
+    const char* emotion = current_emotion_.c_str();
+    DeviceState state = Application::GetInstance().GetDeviceState();
+
+    if (strcmp(emotion, "neutral") != 0) {
+        face = LookupEmotionFace(emotion);
+    }
+    if (face == nullptr) {
+        face = GetStateOverlayFace(state, face_anim_frame_);
+    }
+    if (face == nullptr) {
+        face = &kNeutralFace;
+    }
+
+    lv_label_set_text(face_label_, FormatAsciiFace(*face).c_str());
+
+    if (StateNeedsAnimation(state) && strcmp(emotion, "neutral") == 0) {
+        if (face_anim_timer_ == nullptr) {
+            StartFaceAnimation();
+        }
+    } else {
+        StopFaceAnimation();
+    }
+}
+
+void OledDisplay::RenderAsciiFace() {
+    DisplayLockGuard lock(this);
+    RenderAsciiFaceUnlocked();
+}
+
+void OledDisplay::SetStatus(const char* status) {
+    (void)status;
+    RenderAsciiFace();
+}
+
+void OledDisplay::ShowNotification(const char* notification, int duration_ms) {
+    (void)notification;
+    (void)duration_ms;
+}
+
+void OledDisplay::ClearChatMessages() {
+}
+
+void OledDisplay::UpdateStatusBar(bool update_all) {
+    (void)update_all;
+}
+
+#endif // CONFIG_OLED_ASCII_FACE_128X64
 
 void OledDisplay::SetupUI_128x64() {
     DisplayLockGuard lock(this);
@@ -385,6 +641,15 @@ void OledDisplay::SetupUI_128x32() {
 }
 
 void OledDisplay::SetEmotion(const char* emotion) {
+#if CONFIG_OLED_ASCII_FACE_128X64
+    if (emotion != nullptr && emotion[0] != '\0') {
+        current_emotion_ = emotion;
+    } else {
+        current_emotion_ = "neutral";
+    }
+    RenderAsciiFace();
+    return;
+#endif
     const char* utf8 = font_awesome_get_utf8(emotion);
     DisplayLockGuard lock(this);
     if (emotion_label_ == nullptr) {
