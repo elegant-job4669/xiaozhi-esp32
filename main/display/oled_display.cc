@@ -278,7 +278,7 @@ static const AsciiFace* GetStateOverlayFace(DeviceState state, int anim_frame) {
             static const AsciiFace frames[] = {
                 {"  o   o", "    .", "  . . ."},
                 {"  o   o", "    .", "  .. .."},
-                {"  o   o", "    .", "  ..."}},
+                {"  o   o", "    .", "  ..."},
             };
             return &frames[anim_frame % 3];
         }
