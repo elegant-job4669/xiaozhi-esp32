@@ -183,55 +183,213 @@ void OledDisplay::SetChatMessage(const char* role, const char* content) {
 
 #if CONFIG_OLED_ASCII_FACE_128X64
 
-struct AsciiFace {
-    const char* line1;
-    const char* line2;
-    const char* line3;
+enum class MouthStyle {
+    Flat,
+    Smile,
+    Frown,
+    Wave,
+    OpenWide,
+    Heart,
+    Cup,
+    Star,
+    Circle,
+    Link,
+    DotsAnim,
+    Custom,
 };
 
-static std::string FormatAsciiFace(const AsciiFace& face) {
+struct AsciiFaceParts {
+    char left_eye;
+    char right_eye;
+    char mid_overlay;
+    MouthStyle mouth;
+    const char* custom_mouth;
+    bool chip_eyes;
+};
+
+static int GetFaceColumnCount(const lv_font_t* font) {
+    if (font == nullptr) {
+        return 16;
+    }
+
+    int char_w = lv_font_get_glyph_width(font, 'O', 0);
+    if (char_w <= 0) {
+        char_w = 8;
+    }
+
+    int cols = static_cast<int>(LV_HOR_RES) / char_w;
+    if (cols < 11) {
+        cols = 11;
+    } else if (cols > 20) {
+        cols = 20;
+    }
+    return cols;
+}
+
+static std::string PadCentered(const std::string& text, int cols) {
+    if (static_cast<int>(text.size()) >= cols) {
+        return text.substr(0, cols);
+    }
+    std::string line(cols, ' ');
+    int offset = (cols - static_cast<int>(text.size())) / 2;
+    for (size_t i = 0; i < text.size(); ++i) {
+        line[offset + static_cast<int>(i)] = text[i];
+    }
+    return line;
+}
+
+static std::string BuildEyeLine(char left, char right, int cols) {
+    std::string line(cols, '_');
+    line.front() = left;
+    line.back() = right;
+    return line;
+}
+
+static std::string BuildChipEyeLine(int cols) {
+    std::string line(cols, '_');
+    if (cols >= 7) {
+        line[0] = '[';
+        line[1] = '#';
+        line[2] = ']';
+        line[cols - 3] = '[';
+        line[cols - 2] = '#';
+        line[cols - 1] = ']';
+    }
+    return line;
+}
+
+static std::string BuildThickMidLine(int cols, char fill = '=') {
+    return std::string(cols, fill);
+}
+
+static std::string BuildMidLineWithOverlay(int cols, char overlay, char fill = '=') {
+    auto line = BuildThickMidLine(cols, fill);
+    line[cols / 2] = overlay;
+    return line;
+}
+
+static std::string BuildMouthLine(MouthStyle style, int cols, int anim_frame) {
+    switch (style) {
+    case MouthStyle::Flat:
+        return std::string(cols, '-');
+    case MouthStyle::Smile: {
+        std::string line(cols, '_');
+        line.front() = '\\';
+        line.back() = '/';
+        return line;
+    }
+    case MouthStyle::Frown: {
+        std::string line(cols, '_');
+        line.front() = '/';
+        line.back() = '\\';
+        return line;
+    }
+    case MouthStyle::Wave: {
+        std::string line(cols, '_');
+        line.front() = '~';
+        line.back() = '~';
+        return line;
+    }
+    case MouthStyle::OpenWide: {
+        std::string line(cols, '_');
+        line.front() = '(';
+        line.back() = ')';
+        return line;
+    }
+    case MouthStyle::Heart: {
+        auto line = std::string(cols, '-');
+        int mid = cols / 2;
+        if (mid > 0) {
+            line[mid - 1] = '<';
+        }
+        line[mid] = '3';
+        return line;
+    }
+    case MouthStyle::Cup: {
+        auto line = std::string(cols, '-');
+        line[cols / 2] = 'U';
+        return line;
+    }
+    case MouthStyle::Star: {
+        auto line = std::string(cols, '-');
+        line[cols / 2] = '*';
+        return line;
+    }
+    case MouthStyle::Circle: {
+        auto line = std::string(cols, '-');
+        line[cols / 2] = 'O';
+        return line;
+    }
+    case MouthStyle::Link:
+        return PadCentered("--O--", cols);
+    case MouthStyle::DotsAnim: {
+        static const char* patterns[] = {". . . . .", ".. .. ..", "... ..."};
+        return PadCentered(patterns[anim_frame % 3], cols);
+    }
+    case MouthStyle::Custom:
+    default:
+        return std::string(cols, '-');
+    }
+}
+
+static std::string BuildAsciiFace(const AsciiFaceParts& parts, int cols, int anim_frame = 0) {
     std::string text;
-    text.reserve(32);
-    text.append(face.line1);
+    text.reserve(static_cast<size_t>(cols) * 3 + 4);
+
+    if (parts.chip_eyes) {
+        text += BuildChipEyeLine(cols);
+    } else {
+        text += BuildEyeLine(parts.left_eye, parts.right_eye, cols);
+    }
     text.push_back('\n');
-    text.append(face.line2);
+
+    if (parts.mid_overlay != '\0') {
+        text += BuildMidLineWithOverlay(cols, parts.mid_overlay);
+    } else {
+        text += BuildThickMidLine(cols);
+    }
     text.push_back('\n');
-    text.append(face.line3);
+
+    if (parts.mouth == MouthStyle::Custom && parts.custom_mouth != nullptr) {
+        text += PadCentered(parts.custom_mouth, cols);
+    } else {
+        text += BuildMouthLine(parts.mouth, cols, anim_frame);
+    }
     return text;
 }
 
-static const AsciiFace* LookupEmotionFace(const char* emotion) {
+static const AsciiFaceParts* LookupEmotionFace(const char* emotion) {
     static const struct {
         const char* name;
-        AsciiFace face;
+        AsciiFaceParts parts;
     } kEmotionFaces[] = {
-        {"neutral",     {"  o   o", "    -", "  -----"}},
-        {"happy",       {"  ^   ^", "    -", "  \\___/"}},
-        {"laughing",    {"  *   *", "    -", "  \\___/"}},
-        {"funny",       {"  ^   ^", "    o", "  ~___~"}},
-        {"sad",         {"  >   <", "    -", "  -----"}},
-        {"angry",       {"  >   <", "    -", "  \\___/"}},
-        {"crying",      {"  T   T", "    -", "  \\___/"}},
-        {"loving",      {"  *   *", "    -", "    <3"}},
-        {"embarrassed", {"  @   @", "    -", "  -----"}},
-        {"surprised",   {"  O   O", "    o", "    O"}},
-        {"shocked",     {"  O   O", "    O", "    O"}},
-        {"thinking",    {"  o   .", "    -", "  -----"}},
-        {"winking",     {"  ^   o", "    -", "  -----"}},
-        {"cool",        {"  o   o", "   ---", "  -----"}},
-        {"relaxed",     {"  -   -", "    -", "  -----"}},
-        {"delicious",   {"  ^   ^", "    -", "    U"}},
-        {"kissy",       {"  *   *", "    -", "    *"}},
-        {"confident",   {"  >   <", "    -", "  \\___/"}},
-        {"sleepy",      {"  -   -", "    z", "  -----"}},
-        {"silly",       {"  ^   o", "    -", "  \\___/"}},
-        {"confused",    {"  ?   ?", "    -", "  -----"}},
-        {"microchip_ai",{"  [#] [#]", "    -", "  -----"}},
-        {"link",        {"  o   o", "    -", "  --o--"}},
-        {"triangle_exclamation", {"  X   X", "    !", "  -----"}},
-        {"circle_xmark",{"  X   X", "    !", "  -----"}},
-        {"cloud_slash", {"  >   <", "    -", "  -----"}},
-        {"cloud_arrow_down", {"  o   o", "    .", "  . . ."}},
+        {"neutral",     {'O', 'O', '\0', MouthStyle::Flat, nullptr, false}},
+        {"happy",       {'^', '^', '\0', MouthStyle::Smile, nullptr, false}},
+        {"laughing",    {'*', '*', '\0', MouthStyle::Smile, nullptr, false}},
+        {"funny",       {'^', '^', 'o', MouthStyle::Wave, nullptr, false}},
+        {"sad",         {'>', '<', '\0', MouthStyle::Flat, nullptr, false}},
+        {"angry",       {'>', '<', '\0', MouthStyle::Frown, nullptr, false}},
+        {"crying",      {'T', 'T', '\0', MouthStyle::Frown, nullptr, false}},
+        {"loving",      {'*', '*', '\0', MouthStyle::Heart, nullptr, false}},
+        {"embarrassed", {'@', '@', '\0', MouthStyle::Flat, nullptr, false}},
+        {"surprised",   {'O', 'O', 'o', MouthStyle::Circle, nullptr, false}},
+        {"shocked",     {'O', 'O', 'O', MouthStyle::Circle, nullptr, false}},
+        {"thinking",    {'O', '.', '\0', MouthStyle::Flat, nullptr, false}},
+        {"winking",     {'^', 'O', '\0', MouthStyle::Flat, nullptr, false}},
+        {"cool",        {'O', 'O', '\0', MouthStyle::Flat, nullptr, false}},
+        {"relaxed",     {'-', '-', '\0', MouthStyle::Flat, nullptr, false}},
+        {"delicious",   {'^', '^', '\0', MouthStyle::Cup, nullptr, false}},
+        {"kissy",       {'*', '*', '\0', MouthStyle::Star, nullptr, false}},
+        {"confident",   {'>', '<', '\0', MouthStyle::Smile, nullptr, false}},
+        {"sleepy",      {'-', '-', 'z', MouthStyle::Flat, nullptr, false}},
+        {"silly",       {'^', 'O', '\0', MouthStyle::Smile, nullptr, false}},
+        {"confused",    {'?', '?', '\0', MouthStyle::Flat, nullptr, false}},
+        {"microchip_ai",{'O', 'O', '\0', MouthStyle::Flat, nullptr, true}},
+        {"link",        {'O', 'O', '\0', MouthStyle::Link, nullptr, false}},
+        {"triangle_exclamation", {'X', 'X', '!', MouthStyle::Flat, nullptr, false}},
+        {"circle_xmark",{'X', 'X', '!', MouthStyle::Flat, nullptr, false}},
+        {"cloud_slash", {'>', '<', '\0', MouthStyle::Flat, nullptr, false}},
+        {"cloud_arrow_down", {'O', 'O', '.', MouthStyle::DotsAnim, nullptr, false}},
     };
 
     if (emotion == nullptr) {
@@ -239,35 +397,35 @@ static const AsciiFace* LookupEmotionFace(const char* emotion) {
     }
     for (const auto& item : kEmotionFaces) {
         if (strcmp(emotion, item.name) == 0) {
-            return &item.face;
+            return &item.parts;
         }
     }
     return nullptr;
 }
 
-static const AsciiFace kNeutralFace = {"  o   o", "    -", "  -----"};
-static const AsciiFace kErrorFace = {"  X   X", "    !", "  -----"};
+static const AsciiFaceParts kNeutralFace = {'O', 'O', '\0', MouthStyle::Flat, nullptr, false};
+static const AsciiFaceParts kErrorFace = {'X', 'X', '!', MouthStyle::Flat, nullptr, false};
 
-static const AsciiFace* GetStateOverlayFace(DeviceState state, int anim_frame) {
+static const AsciiFaceParts* GetStateOverlayFace(DeviceState state, int anim_frame) {
     switch (state) {
         case kDeviceStateListening: {
-            static const AsciiFace frames[] = {
-                {"  ^   ^", "    o", "  -----"},
-                {"  -   -", "    o", "  -----"},
+            static const AsciiFaceParts frames[] = {
+                {'^', '^', 'o', MouthStyle::Flat, nullptr, false},
+                {'-', '-', 'o', MouthStyle::Flat, nullptr, false},
             };
             return &frames[anim_frame % 2];
         }
         case kDeviceStateConnecting: {
-            static const AsciiFace frames[] = {
-                {"  .   .", "    o", "  . . ."},
-                {"  o   o", "    -", "  . . ."},
+            static const AsciiFaceParts frames[] = {
+                {'.', '.', 'o', MouthStyle::DotsAnim, nullptr, false},
+                {'O', 'O', '-', MouthStyle::DotsAnim, nullptr, false},
             };
             return &frames[anim_frame % 2];
         }
         case kDeviceStateSpeaking: {
-            static const AsciiFace frames[] = {
-                {"  o   o", "    O", "  -----"},
-                {"  o   o", "    o", "  -----"},
+            static const AsciiFaceParts frames[] = {
+                {'O', 'O', 'O', MouthStyle::Flat, nullptr, false},
+                {'O', 'O', 'o', MouthStyle::Flat, nullptr, false},
             };
             return &frames[anim_frame % 2];
         }
@@ -275,10 +433,10 @@ static const AsciiFace* GetStateOverlayFace(DeviceState state, int anim_frame) {
         case kDeviceStateActivating:
         case kDeviceStateUpgrading:
         case kDeviceStateAudioTesting: {
-            static const AsciiFace frames[] = {
-                {"  o   o", "    .", "  . . ."},
-                {"  o   o", "    .", "  .. .."},
-                {"  o   o", "    .", "  ..."},
+            static const AsciiFaceParts frames[] = {
+                {'O', 'O', '.', MouthStyle::DotsAnim, nullptr, false},
+                {'O', 'O', '.', MouthStyle::DotsAnim, nullptr, false},
+                {'O', 'O', '.', MouthStyle::DotsAnim, nullptr, false},
             };
             return &frames[anim_frame % 3];
         }
@@ -358,8 +516,9 @@ void OledDisplay::SetupUI_128x64_AsciiFace() {
 
     face_label_ = lv_label_create(container_);
     lv_obj_set_width(face_label_, LV_HOR_RES);
-    lv_obj_set_style_text_align(face_label_, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_line_space(face_label_, 2, 0);
+    lv_obj_set_style_text_align(face_label_, LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_set_style_text_line_space(face_label_, 6, 0);
+    lv_obj_set_style_pad_all(face_label_, 0, 0);
     lv_obj_center(face_label_);
     lv_label_set_text(face_label_, "");
 
@@ -372,7 +531,7 @@ void OledDisplay::RenderAsciiFaceUnlocked() {
         return;
     }
 
-    const AsciiFace* face = nullptr;
+    const AsciiFaceParts* face = nullptr;
     const char* emotion = current_emotion_.c_str();
     DeviceState state = Application::GetInstance().GetDeviceState();
 
@@ -386,7 +545,9 @@ void OledDisplay::RenderAsciiFaceUnlocked() {
         face = &kNeutralFace;
     }
 
-    lv_label_set_text(face_label_, FormatAsciiFace(*face).c_str());
+    const lv_font_t* font = lv_obj_get_style_text_font(face_label_, LV_PART_MAIN);
+    const int cols = GetFaceColumnCount(font);
+    lv_label_set_text(face_label_, BuildAsciiFace(*face, cols, face_anim_frame_).c_str());
 
     if (StateNeedsAnimation(state) && strcmp(emotion, "neutral") == 0) {
         if (face_anim_timer_ == nullptr) {
