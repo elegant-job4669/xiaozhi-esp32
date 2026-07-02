@@ -2,6 +2,7 @@
 #include "assets/lang_config.h"
 #include "lvgl_theme.h"
 #include "lvgl_font.h"
+#include "display/lvgl_display/emoji_collection.h"
 #include "application.h"
 #include "device_state.h"
 
@@ -34,6 +35,9 @@ OledDisplay::OledDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handl
     dark_theme->set_text_font(text_font);
     dark_theme->set_icon_font(icon_font);
     dark_theme->set_large_icon_font(large_icon_font);
+#if CONFIG_OLED_ASCII_FACE_128X64
+    dark_theme->set_emoji_collection(std::make_shared<Twemoji64>());
+#endif
 
     auto& theme_manager = LvglThemeManager::GetInstance();
     theme_manager.RegisterTheme("dark", dark_theme);
@@ -105,6 +109,10 @@ void OledDisplay::SetupUI() {
 OledDisplay::~OledDisplay() {
 #if CONFIG_OLED_ASCII_FACE_128X64
     StopFaceAnimation();
+    if (face_gif_controller_) {
+        face_gif_controller_->Stop();
+        face_gif_controller_.reset();
+    }
 #endif
 
     if (content_ != nullptr) {
@@ -183,268 +191,14 @@ void OledDisplay::SetChatMessage(const char* role, const char* content) {
 
 #if CONFIG_OLED_ASCII_FACE_128X64
 
-enum class MouthStyle {
-    Flat,
-    Smile,
-    Frown,
-    Wave,
-    OpenWide,
-    Heart,
-    Cup,
-    Star,
-    Circle,
-    Link,
-    DotsAnim,
-    Custom,
-};
-
-struct AsciiFaceParts {
-    char left_eye;
-    char right_eye;
-    char mid_overlay;
-    MouthStyle mouth;
-    const char* custom_mouth;
-    bool chip_eyes;
-};
-
-static int GetFaceColumnCount(const lv_font_t* font) {
-    if (font == nullptr) {
-        return 16;
+static void ScaleImageToFitScreen(lv_obj_t* image, const lv_img_dsc_t* img_dsc) {
+    if (image == nullptr || img_dsc == nullptr || img_dsc->header.w <= 0 || img_dsc->header.h <= 0) {
+        return;
     }
 
-    int char_w = lv_font_get_glyph_width(font, 'O', 0);
-    if (char_w <= 0) {
-        char_w = 8;
-    }
-
-    int cols = static_cast<int>(LV_HOR_RES) / char_w;
-    if (cols < 11) {
-        cols = 11;
-    } else if (cols > 20) {
-        cols = 20;
-    }
-    return cols;
-}
-
-static std::string PadCentered(const std::string& text, int cols) {
-    if (static_cast<int>(text.size()) >= cols) {
-        return text.substr(0, cols);
-    }
-    std::string line(cols, ' ');
-    int offset = (cols - static_cast<int>(text.size())) / 2;
-    for (size_t i = 0; i < text.size(); ++i) {
-        line[offset + static_cast<int>(i)] = text[i];
-    }
-    return line;
-}
-
-static std::string BuildEyeLine(char left, char right, int cols) {
-    std::string line(cols, '_');
-    line.front() = left;
-    line.back() = right;
-    return line;
-}
-
-static std::string BuildChipEyeLine(int cols) {
-    std::string line(cols, '_');
-    if (cols >= 7) {
-        line[0] = '[';
-        line[1] = '#';
-        line[2] = ']';
-        line[cols - 3] = '[';
-        line[cols - 2] = '#';
-        line[cols - 1] = ']';
-    }
-    return line;
-}
-
-static std::string BuildThickMidLine(int cols, char fill = '=') {
-    return std::string(cols, fill);
-}
-
-static std::string BuildMidLineWithOverlay(int cols, char overlay, char fill = '=') {
-    auto line = BuildThickMidLine(cols, fill);
-    line[cols / 2] = overlay;
-    return line;
-}
-
-static std::string BuildMouthLine(MouthStyle style, int cols, int anim_frame) {
-    switch (style) {
-    case MouthStyle::Flat:
-        return std::string(cols, '-');
-    case MouthStyle::Smile: {
-        std::string line(cols, '_');
-        line.front() = '\\';
-        line.back() = '/';
-        return line;
-    }
-    case MouthStyle::Frown: {
-        std::string line(cols, '_');
-        line.front() = '/';
-        line.back() = '\\';
-        return line;
-    }
-    case MouthStyle::Wave: {
-        std::string line(cols, '_');
-        line.front() = '~';
-        line.back() = '~';
-        return line;
-    }
-    case MouthStyle::OpenWide: {
-        std::string line(cols, '_');
-        line.front() = '(';
-        line.back() = ')';
-        return line;
-    }
-    case MouthStyle::Heart: {
-        auto line = std::string(cols, '-');
-        int mid = cols / 2;
-        if (mid > 0) {
-            line[mid - 1] = '<';
-        }
-        line[mid] = '3';
-        return line;
-    }
-    case MouthStyle::Cup: {
-        auto line = std::string(cols, '-');
-        line[cols / 2] = 'U';
-        return line;
-    }
-    case MouthStyle::Star: {
-        auto line = std::string(cols, '-');
-        line[cols / 2] = '*';
-        return line;
-    }
-    case MouthStyle::Circle: {
-        auto line = std::string(cols, '-');
-        line[cols / 2] = 'O';
-        return line;
-    }
-    case MouthStyle::Link:
-        return PadCentered("--O--", cols);
-    case MouthStyle::DotsAnim: {
-        static const char* patterns[] = {". . . . .", ".. .. ..", "... ..."};
-        return PadCentered(patterns[anim_frame % 3], cols);
-    }
-    case MouthStyle::Custom:
-    default:
-        return std::string(cols, '-');
-    }
-}
-
-static std::string BuildAsciiFace(const AsciiFaceParts& parts, int cols, int anim_frame = 0) {
-    std::string text;
-    text.reserve(static_cast<size_t>(cols) * 3 + 4);
-
-    if (parts.chip_eyes) {
-        text += BuildChipEyeLine(cols);
-    } else {
-        text += BuildEyeLine(parts.left_eye, parts.right_eye, cols);
-    }
-    text.push_back('\n');
-
-    if (parts.mid_overlay != '\0') {
-        text += BuildMidLineWithOverlay(cols, parts.mid_overlay);
-    } else {
-        text += BuildThickMidLine(cols);
-    }
-    text.push_back('\n');
-
-    if (parts.mouth == MouthStyle::Custom && parts.custom_mouth != nullptr) {
-        text += PadCentered(parts.custom_mouth, cols);
-    } else {
-        text += BuildMouthLine(parts.mouth, cols, anim_frame);
-    }
-    return text;
-}
-
-static const AsciiFaceParts* LookupEmotionFace(const char* emotion) {
-    static const struct {
-        const char* name;
-        AsciiFaceParts parts;
-    } kEmotionFaces[] = {
-        {"neutral",     {'O', 'O', '\0', MouthStyle::Flat, nullptr, false}},
-        {"happy",       {'^', '^', '\0', MouthStyle::Smile, nullptr, false}},
-        {"laughing",    {'*', '*', '\0', MouthStyle::Smile, nullptr, false}},
-        {"funny",       {'^', '^', 'o', MouthStyle::Wave, nullptr, false}},
-        {"sad",         {'>', '<', '\0', MouthStyle::Flat, nullptr, false}},
-        {"angry",       {'>', '<', '\0', MouthStyle::Frown, nullptr, false}},
-        {"crying",      {'T', 'T', '\0', MouthStyle::Frown, nullptr, false}},
-        {"loving",      {'*', '*', '\0', MouthStyle::Heart, nullptr, false}},
-        {"embarrassed", {'@', '@', '\0', MouthStyle::Flat, nullptr, false}},
-        {"surprised",   {'O', 'O', 'o', MouthStyle::Circle, nullptr, false}},
-        {"shocked",     {'O', 'O', 'O', MouthStyle::Circle, nullptr, false}},
-        {"thinking",    {'O', '.', '\0', MouthStyle::Flat, nullptr, false}},
-        {"winking",     {'^', 'O', '\0', MouthStyle::Flat, nullptr, false}},
-        {"cool",        {'O', 'O', '\0', MouthStyle::Flat, nullptr, false}},
-        {"relaxed",     {'-', '-', '\0', MouthStyle::Flat, nullptr, false}},
-        {"delicious",   {'^', '^', '\0', MouthStyle::Cup, nullptr, false}},
-        {"kissy",       {'*', '*', '\0', MouthStyle::Star, nullptr, false}},
-        {"confident",   {'>', '<', '\0', MouthStyle::Smile, nullptr, false}},
-        {"sleepy",      {'-', '-', 'z', MouthStyle::Flat, nullptr, false}},
-        {"silly",       {'^', 'O', '\0', MouthStyle::Smile, nullptr, false}},
-        {"confused",    {'?', '?', '\0', MouthStyle::Flat, nullptr, false}},
-        {"microchip_ai",{'O', 'O', '\0', MouthStyle::Flat, nullptr, true}},
-        {"link",        {'O', 'O', '\0', MouthStyle::Link, nullptr, false}},
-        {"triangle_exclamation", {'X', 'X', '!', MouthStyle::Flat, nullptr, false}},
-        {"circle_xmark",{'X', 'X', '!', MouthStyle::Flat, nullptr, false}},
-        {"cloud_slash", {'>', '<', '\0', MouthStyle::Flat, nullptr, false}},
-        {"cloud_arrow_down", {'O', 'O', '.', MouthStyle::DotsAnim, nullptr, false}},
-    };
-
-    if (emotion == nullptr) {
-        return nullptr;
-    }
-    for (const auto& item : kEmotionFaces) {
-        if (strcmp(emotion, item.name) == 0) {
-            return &item.parts;
-        }
-    }
-    return nullptr;
-}
-
-static const AsciiFaceParts kNeutralFace = {'O', 'O', '\0', MouthStyle::Flat, nullptr, false};
-static const AsciiFaceParts kErrorFace = {'X', 'X', '!', MouthStyle::Flat, nullptr, false};
-
-static const AsciiFaceParts* GetStateOverlayFace(DeviceState state, int anim_frame) {
-    switch (state) {
-        case kDeviceStateListening: {
-            static const AsciiFaceParts frames[] = {
-                {'^', '^', 'o', MouthStyle::Flat, nullptr, false},
-                {'-', '-', 'o', MouthStyle::Flat, nullptr, false},
-            };
-            return &frames[anim_frame % 2];
-        }
-        case kDeviceStateConnecting: {
-            static const AsciiFaceParts frames[] = {
-                {'.', '.', 'o', MouthStyle::DotsAnim, nullptr, false},
-                {'O', 'O', '-', MouthStyle::DotsAnim, nullptr, false},
-            };
-            return &frames[anim_frame % 2];
-        }
-        case kDeviceStateSpeaking: {
-            static const AsciiFaceParts frames[] = {
-                {'O', 'O', 'O', MouthStyle::Flat, nullptr, false},
-                {'O', 'O', 'o', MouthStyle::Flat, nullptr, false},
-            };
-            return &frames[anim_frame % 2];
-        }
-        case kDeviceStateStarting:
-        case kDeviceStateActivating:
-        case kDeviceStateUpgrading:
-        case kDeviceStateAudioTesting: {
-            static const AsciiFaceParts frames[] = {
-                {'O', 'O', '.', MouthStyle::DotsAnim, nullptr, false},
-                {'O', 'O', '.', MouthStyle::DotsAnim, nullptr, false},
-                {'O', 'O', '.', MouthStyle::DotsAnim, nullptr, false},
-            };
-            return &frames[anim_frame % 3];
-        }
-        case kDeviceStateFatalError:
-            return &kErrorFace;
-        default:
-            return nullptr;
-    }
+    const int scale_w = 256 * LV_HOR_RES / img_dsc->header.w;
+    const int scale_h = 256 * LV_VER_RES / img_dsc->header.h;
+    lv_image_set_scale(image, std::min(scale_w, scale_h));
 }
 
 static bool StateNeedsAnimation(DeviceState state) {
@@ -462,13 +216,104 @@ static bool StateNeedsAnimation(DeviceState state) {
     }
 }
 
+static const char* GetStateOverlayEmotion(DeviceState state, int anim_frame) {
+    switch (state) {
+        case kDeviceStateListening: {
+            static const char* frames[] = {"thinking", "neutral"};
+            return frames[anim_frame % 2];
+        }
+        case kDeviceStateConnecting: {
+            static const char* frames[] = {"confused", "thinking"};
+            return frames[anim_frame % 2];
+        }
+        case kDeviceStateSpeaking: {
+            static const char* frames[] = {"happy", "laughing"};
+            return frames[anim_frame % 2];
+        }
+        case kDeviceStateStarting:
+        case kDeviceStateActivating:
+        case kDeviceStateUpgrading:
+        case kDeviceStateAudioTesting: {
+            static const char* frames[] = {"thinking", "confused", "neutral"};
+            return frames[anim_frame % 3];
+        }
+        case kDeviceStateFatalError:
+            return "circle_xmark";
+        default:
+            return nullptr;
+    }
+}
+
+const char* OledDisplay::ResolveEmotionToShow() const {
+    const char* emotion = current_emotion_.c_str();
+    if (strcmp(emotion, "neutral") != 0) {
+        return emotion;
+    }
+
+    DeviceState state = Application::GetInstance().GetDeviceState();
+    const char* overlay = GetStateOverlayEmotion(state, face_anim_frame_);
+    return overlay != nullptr ? overlay : emotion;
+}
+
+void OledDisplay::ShowEmotionImage(const LvglImage* image) {
+    if (face_image_ == nullptr || image == nullptr) {
+        return;
+    }
+
+    if (face_gif_controller_) {
+        face_gif_controller_->Stop();
+        face_gif_controller_.reset();
+    }
+
+    if (image->IsGif()) {
+        face_gif_controller_ = std::make_unique<LvglGif>(image->image_dsc());
+        if (face_gif_controller_->IsLoaded()) {
+            face_gif_controller_->SetFrameCallback([this]() {
+                lv_image_set_src(face_image_, face_gif_controller_->image_dsc());
+            });
+            lv_image_set_src(face_image_, face_gif_controller_->image_dsc());
+            ScaleImageToFitScreen(face_image_, face_gif_controller_->image_dsc());
+            face_gif_controller_->Start();
+            lv_obj_add_flag(face_icon_label_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(face_image_, LV_OBJ_FLAG_HIDDEN);
+            return;
+        }
+        face_gif_controller_.reset();
+    }
+
+    lv_image_set_src(face_image_, image->image_dsc());
+    ScaleImageToFitScreen(face_image_, image->image_dsc());
+    lv_obj_add_flag(face_icon_label_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(face_image_, LV_OBJ_FLAG_HIDDEN);
+}
+
+void OledDisplay::ShowEmotionIcon(const char* emotion) {
+    if (face_icon_label_ == nullptr) {
+        return;
+    }
+
+    if (face_gif_controller_) {
+        face_gif_controller_->Stop();
+        face_gif_controller_.reset();
+    }
+
+    const char* utf8 = font_awesome_get_utf8(emotion);
+    if (utf8 == nullptr) {
+        utf8 = FONT_AWESOME_NEUTRAL;
+    }
+
+    lv_label_set_text(face_icon_label_, utf8);
+    lv_obj_add_flag(face_image_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(face_icon_label_, LV_OBJ_FLAG_HIDDEN);
+}
+
 void OledDisplay::FaceAnimTimerCallback(void* arg) {
     auto* display = static_cast<OledDisplay*>(arg);
     display->face_anim_frame_++;
     if (!display->Lock(0)) {
         return;
     }
-    display->RenderAsciiFaceUnlocked();
+    display->RenderEmotionFaceUnlocked();
     display->Unlock();
 }
 
@@ -478,7 +323,7 @@ void OledDisplay::StartFaceAnimation() {
             .callback = FaceAnimTimerCallback,
             .arg = this,
             .dispatch_method = ESP_TIMER_TASK,
-            .name = "ascii_face_anim",
+            .name = "emoji_face_anim",
             .skip_unhandled_events = true,
         };
         ESP_ERROR_CHECK(esp_timer_create(&timer_args, &face_anim_timer_));
@@ -501,6 +346,7 @@ void OledDisplay::SetupUI_128x64_AsciiFace() {
 
     auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
     auto text_font = lvgl_theme->text_font()->font();
+    auto large_icon_font = lvgl_theme->large_icon_font()->font();
 
     auto screen = lv_screen_active();
     lv_obj_set_style_text_font(screen, text_font, 0);
@@ -514,42 +360,37 @@ void OledDisplay::SetupUI_128x64_AsciiFace() {
     lv_obj_set_style_bg_opa(container_, LV_OPA_TRANSP, 0);
     lv_obj_clear_flag(container_, LV_OBJ_FLAG_SCROLLABLE);
 
-    face_label_ = lv_label_create(container_);
-    lv_obj_set_width(face_label_, LV_HOR_RES);
-    lv_obj_set_style_text_align(face_label_, LV_TEXT_ALIGN_LEFT, 0);
-    lv_obj_set_style_text_line_space(face_label_, 6, 0);
-    lv_obj_set_style_pad_all(face_label_, 0, 0);
-    lv_obj_center(face_label_);
-    lv_label_set_text(face_label_, "");
+    face_image_ = lv_img_create(container_);
+    lv_obj_center(face_image_);
+    lv_obj_add_flag(face_image_, LV_OBJ_FLAG_HIDDEN);
+
+    face_icon_label_ = lv_label_create(container_);
+    lv_obj_set_style_text_font(face_icon_label_, large_icon_font, 0);
+    lv_obj_center(face_icon_label_);
+    lv_label_set_text(face_icon_label_, FONT_AWESOME_NEUTRAL);
+    lv_obj_add_flag(face_icon_label_, LV_OBJ_FLAG_HIDDEN);
 
     current_emotion_ = "neutral";
-    RenderAsciiFaceUnlocked();
+    RenderEmotionFaceUnlocked();
 }
 
-void OledDisplay::RenderAsciiFaceUnlocked() {
-    if (face_label_ == nullptr) {
+void OledDisplay::RenderEmotionFaceUnlocked() {
+    if (face_image_ == nullptr) {
         return;
     }
 
-    const AsciiFaceParts* face = nullptr;
-    const char* emotion = current_emotion_.c_str();
+    const char* emotion = ResolveEmotionToShow();
+    auto emoji_collection = static_cast<LvglTheme*>(current_theme_)->emoji_collection();
+    const LvglImage* image = emoji_collection != nullptr ? emoji_collection->GetEmojiImage(emotion) : nullptr;
+
+    if (image != nullptr) {
+        ShowEmotionImage(image);
+    } else {
+        ShowEmotionIcon(emotion);
+    }
+
     DeviceState state = Application::GetInstance().GetDeviceState();
-
-    if (strcmp(emotion, "neutral") != 0) {
-        face = LookupEmotionFace(emotion);
-    }
-    if (face == nullptr) {
-        face = GetStateOverlayFace(state, face_anim_frame_);
-    }
-    if (face == nullptr) {
-        face = &kNeutralFace;
-    }
-
-    const lv_font_t* font = lv_obj_get_style_text_font(face_label_, LV_PART_MAIN);
-    const int cols = GetFaceColumnCount(font);
-    lv_label_set_text(face_label_, BuildAsciiFace(*face, cols, face_anim_frame_).c_str());
-
-    if (StateNeedsAnimation(state) && strcmp(emotion, "neutral") == 0) {
+    if (StateNeedsAnimation(state) && strcmp(current_emotion_.c_str(), "neutral") == 0) {
         if (face_anim_timer_ == nullptr) {
             StartFaceAnimation();
         }
@@ -558,14 +399,14 @@ void OledDisplay::RenderAsciiFaceUnlocked() {
     }
 }
 
-void OledDisplay::RenderAsciiFace() {
+void OledDisplay::RenderEmotionFace() {
     DisplayLockGuard lock(this);
-    RenderAsciiFaceUnlocked();
+    RenderEmotionFaceUnlocked();
 }
 
 void OledDisplay::SetStatus(const char* status) {
     (void)status;
-    RenderAsciiFace();
+    RenderEmotionFace();
 }
 
 void OledDisplay::ShowNotification(const char* notification, int duration_ms) {
@@ -808,7 +649,7 @@ void OledDisplay::SetEmotion(const char* emotion) {
     } else {
         current_emotion_ = "neutral";
     }
-    RenderAsciiFace();
+    RenderEmotionFace();
     return;
 #endif
     const char* utf8 = font_awesome_get_utf8(emotion);
