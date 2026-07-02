@@ -718,11 +718,11 @@ choice DISPLAY_OLED_TYPE
 endchoice
 
 config OLED_ASCII_FACE_128X64
-    bool "ASCII emoticon face display (128x64 OLED)"
+    bool "Full-screen emoji face display (128x64 OLED)"
     depends on OLED_SSD1306_128X64 || OLED_SH1106_128X64
     default n
     help
-        Show a stylized ASCII emoticon face on the full 128x64 OLED screen.
+        Show a full-screen emoji face image on the 128x64 OLED.
         Hides status icons, status text, and chat transcription.
 
 choice DISPLAY_LCD_TYPE

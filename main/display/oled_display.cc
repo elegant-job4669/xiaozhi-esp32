@@ -2,6 +2,7 @@
 #include "assets/lang_config.h"
 #include "lvgl_theme.h"
 #include "lvgl_font.h"
+#include "display/lvgl_display/emoji_collection.h"
 #include "application.h"
 #include "device_state.h"
 
@@ -34,6 +35,9 @@ OledDisplay::OledDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handl
     dark_theme->set_text_font(text_font);
     dark_theme->set_icon_font(icon_font);
     dark_theme->set_large_icon_font(large_icon_font);
+#if CONFIG_OLED_ASCII_FACE_128X64
+    dark_theme->set_emoji_collection(std::make_shared<Twemoji64>());
+#endif
 
     auto& theme_manager = LvglThemeManager::GetInstance();
     theme_manager.RegisterTheme("dark", dark_theme);
@@ -105,6 +109,10 @@ void OledDisplay::SetupUI() {
 OledDisplay::~OledDisplay() {
 #if CONFIG_OLED_ASCII_FACE_128X64
     StopFaceAnimation();
+    if (face_gif_controller_) {
+        face_gif_controller_->Stop();
+        face_gif_controller_.reset();
+    }
 #endif
 
     if (content_ != nullptr) {
@@ -183,110 +191,14 @@ void OledDisplay::SetChatMessage(const char* role, const char* content) {
 
 #if CONFIG_OLED_ASCII_FACE_128X64
 
-struct AsciiFace {
-    const char* line1;
-    const char* line2;
-    const char* line3;
-};
-
-static std::string FormatAsciiFace(const AsciiFace& face) {
-    std::string text;
-    text.reserve(32);
-    text.append(face.line1);
-    text.push_back('\n');
-    text.append(face.line2);
-    text.push_back('\n');
-    text.append(face.line3);
-    return text;
-}
-
-static const AsciiFace* LookupEmotionFace(const char* emotion) {
-    static const struct {
-        const char* name;
-        AsciiFace face;
-    } kEmotionFaces[] = {
-        {"neutral",     {"  o   o", "    -", "  -----"}},
-        {"happy",       {"  ^   ^", "    -", "  \\___/"}},
-        {"laughing",    {"  *   *", "    -", "  \\___/"}},
-        {"funny",       {"  ^   ^", "    o", "  ~___~"}},
-        {"sad",         {"  >   <", "    -", "  -----"}},
-        {"angry",       {"  >   <", "    -", "  \\___/"}},
-        {"crying",      {"  T   T", "    -", "  \\___/"}},
-        {"loving",      {"  *   *", "    -", "    <3"}},
-        {"embarrassed", {"  @   @", "    -", "  -----"}},
-        {"surprised",   {"  O   O", "    o", "    O"}},
-        {"shocked",     {"  O   O", "    O", "    O"}},
-        {"thinking",    {"  o   .", "    -", "  -----"}},
-        {"winking",     {"  ^   o", "    -", "  -----"}},
-        {"cool",        {"  o   o", "   ---", "  -----"}},
-        {"relaxed",     {"  -   -", "    -", "  -----"}},
-        {"delicious",   {"  ^   ^", "    -", "    U"}},
-        {"kissy",       {"  *   *", "    -", "    *"}},
-        {"confident",   {"  >   <", "    -", "  \\___/"}},
-        {"sleepy",      {"  -   -", "    z", "  -----"}},
-        {"silly",       {"  ^   o", "    -", "  \\___/"}},
-        {"confused",    {"  ?   ?", "    -", "  -----"}},
-        {"microchip_ai",{"  [#] [#]", "    -", "  -----"}},
-        {"link",        {"  o   o", "    -", "  --o--"}},
-        {"triangle_exclamation", {"  X   X", "    !", "  -----"}},
-        {"circle_xmark",{"  X   X", "    !", "  -----"}},
-        {"cloud_slash", {"  >   <", "    -", "  -----"}},
-        {"cloud_arrow_down", {"  o   o", "    .", "  . . ."}},
-    };
-
-    if (emotion == nullptr) {
-        return nullptr;
+static void ScaleImageToFitScreen(lv_obj_t* image, const lv_img_dsc_t* img_dsc) {
+    if (image == nullptr || img_dsc == nullptr || img_dsc->header.w <= 0 || img_dsc->header.h <= 0) {
+        return;
     }
-    for (const auto& item : kEmotionFaces) {
-        if (strcmp(emotion, item.name) == 0) {
-            return &item.face;
-        }
-    }
-    return nullptr;
-}
 
-static const AsciiFace kNeutralFace = {"  o   o", "    -", "  -----"};
-static const AsciiFace kErrorFace = {"  X   X", "    !", "  -----"};
-
-static const AsciiFace* GetStateOverlayFace(DeviceState state, int anim_frame) {
-    switch (state) {
-        case kDeviceStateListening: {
-            static const AsciiFace frames[] = {
-                {"  ^   ^", "    o", "  -----"},
-                {"  -   -", "    o", "  -----"},
-            };
-            return &frames[anim_frame % 2];
-        }
-        case kDeviceStateConnecting: {
-            static const AsciiFace frames[] = {
-                {"  .   .", "    o", "  . . ."},
-                {"  o   o", "    -", "  . . ."},
-            };
-            return &frames[anim_frame % 2];
-        }
-        case kDeviceStateSpeaking: {
-            static const AsciiFace frames[] = {
-                {"  o   o", "    O", "  -----"},
-                {"  o   o", "    o", "  -----"},
-            };
-            return &frames[anim_frame % 2];
-        }
-        case kDeviceStateStarting:
-        case kDeviceStateActivating:
-        case kDeviceStateUpgrading:
-        case kDeviceStateAudioTesting: {
-            static const AsciiFace frames[] = {
-                {"  o   o", "    .", "  . . ."},
-                {"  o   o", "    .", "  .. .."},
-                {"  o   o", "    .", "  ..."},
-            };
-            return &frames[anim_frame % 3];
-        }
-        case kDeviceStateFatalError:
-            return &kErrorFace;
-        default:
-            return nullptr;
-    }
+    const int scale_w = 256 * LV_HOR_RES / img_dsc->header.w;
+    const int scale_h = 256 * LV_VER_RES / img_dsc->header.h;
+    lv_image_set_scale(image, std::min(scale_w, scale_h));
 }
 
 static bool StateNeedsAnimation(DeviceState state) {
@@ -304,13 +216,104 @@ static bool StateNeedsAnimation(DeviceState state) {
     }
 }
 
+static const char* GetStateOverlayEmotion(DeviceState state, int anim_frame) {
+    switch (state) {
+        case kDeviceStateListening: {
+            static const char* frames[] = {"thinking", "neutral"};
+            return frames[anim_frame % 2];
+        }
+        case kDeviceStateConnecting: {
+            static const char* frames[] = {"confused", "thinking"};
+            return frames[anim_frame % 2];
+        }
+        case kDeviceStateSpeaking: {
+            static const char* frames[] = {"happy", "laughing"};
+            return frames[anim_frame % 2];
+        }
+        case kDeviceStateStarting:
+        case kDeviceStateActivating:
+        case kDeviceStateUpgrading:
+        case kDeviceStateAudioTesting: {
+            static const char* frames[] = {"thinking", "confused", "neutral"};
+            return frames[anim_frame % 3];
+        }
+        case kDeviceStateFatalError:
+            return "circle_xmark";
+        default:
+            return nullptr;
+    }
+}
+
+const char* OledDisplay::ResolveEmotionToShow() const {
+    const char* emotion = current_emotion_.c_str();
+    if (strcmp(emotion, "neutral") != 0) {
+        return emotion;
+    }
+
+    DeviceState state = Application::GetInstance().GetDeviceState();
+    const char* overlay = GetStateOverlayEmotion(state, face_anim_frame_);
+    return overlay != nullptr ? overlay : emotion;
+}
+
+void OledDisplay::ShowEmotionImage(const LvglImage* image) {
+    if (face_image_ == nullptr || image == nullptr) {
+        return;
+    }
+
+    if (face_gif_controller_) {
+        face_gif_controller_->Stop();
+        face_gif_controller_.reset();
+    }
+
+    if (image->IsGif()) {
+        face_gif_controller_ = std::make_unique<LvglGif>(image->image_dsc());
+        if (face_gif_controller_->IsLoaded()) {
+            face_gif_controller_->SetFrameCallback([this]() {
+                lv_image_set_src(face_image_, face_gif_controller_->image_dsc());
+            });
+            lv_image_set_src(face_image_, face_gif_controller_->image_dsc());
+            ScaleImageToFitScreen(face_image_, face_gif_controller_->image_dsc());
+            face_gif_controller_->Start();
+            lv_obj_add_flag(face_icon_label_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(face_image_, LV_OBJ_FLAG_HIDDEN);
+            return;
+        }
+        face_gif_controller_.reset();
+    }
+
+    lv_image_set_src(face_image_, image->image_dsc());
+    ScaleImageToFitScreen(face_image_, image->image_dsc());
+    lv_obj_add_flag(face_icon_label_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(face_image_, LV_OBJ_FLAG_HIDDEN);
+}
+
+void OledDisplay::ShowEmotionIcon(const char* emotion) {
+    if (face_icon_label_ == nullptr) {
+        return;
+    }
+
+    if (face_gif_controller_) {
+        face_gif_controller_->Stop();
+        face_gif_controller_.reset();
+    }
+
+    const char* utf8 = font_awesome_get_utf8(emotion);
+    if (utf8 == nullptr) {
+        utf8 = FONT_AWESOME_NEUTRAL;
+    }
+
+    lv_label_set_text(face_icon_label_, utf8);
+    lv_obj_add_flag(face_image_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(face_icon_label_, LV_OBJ_FLAG_HIDDEN);
+}
+
 void OledDisplay::FaceAnimTimerCallback(void* arg) {
     auto* display = static_cast<OledDisplay*>(arg);
     display->face_anim_frame_++;
     if (!display->Lock(0)) {
         return;
     }
-    display->RenderAsciiFaceUnlocked();
+    display->RenderEmotionFaceUnlocked();
     display->Unlock();
 }
 
@@ -320,7 +323,7 @@ void OledDisplay::StartFaceAnimation() {
             .callback = FaceAnimTimerCallback,
             .arg = this,
             .dispatch_method = ESP_TIMER_TASK,
-            .name = "ascii_face_anim",
+            .name = "emoji_face_anim",
             .skip_unhandled_events = true,
         };
         ESP_ERROR_CHECK(esp_timer_create(&timer_args, &face_anim_timer_));
@@ -343,6 +346,7 @@ void OledDisplay::SetupUI_128x64_AsciiFace() {
 
     auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
     auto text_font = lvgl_theme->text_font()->font();
+    auto large_icon_font = lvgl_theme->large_icon_font()->font();
 
     auto screen = lv_screen_active();
     lv_obj_set_style_text_font(screen, text_font, 0);
@@ -356,39 +360,37 @@ void OledDisplay::SetupUI_128x64_AsciiFace() {
     lv_obj_set_style_bg_opa(container_, LV_OPA_TRANSP, 0);
     lv_obj_clear_flag(container_, LV_OBJ_FLAG_SCROLLABLE);
 
-    face_label_ = lv_label_create(container_);
-    lv_obj_set_width(face_label_, LV_HOR_RES);
-    lv_obj_set_style_text_align(face_label_, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_line_space(face_label_, 2, 0);
-    lv_obj_center(face_label_);
-    lv_label_set_text(face_label_, "");
+    face_image_ = lv_img_create(container_);
+    lv_obj_center(face_image_);
+    lv_obj_add_flag(face_image_, LV_OBJ_FLAG_HIDDEN);
+
+    face_icon_label_ = lv_label_create(container_);
+    lv_obj_set_style_text_font(face_icon_label_, large_icon_font, 0);
+    lv_obj_center(face_icon_label_);
+    lv_label_set_text(face_icon_label_, FONT_AWESOME_NEUTRAL);
+    lv_obj_add_flag(face_icon_label_, LV_OBJ_FLAG_HIDDEN);
 
     current_emotion_ = "neutral";
-    RenderAsciiFaceUnlocked();
+    RenderEmotionFaceUnlocked();
 }
 
-void OledDisplay::RenderAsciiFaceUnlocked() {
-    if (face_label_ == nullptr) {
+void OledDisplay::RenderEmotionFaceUnlocked() {
+    if (face_image_ == nullptr) {
         return;
     }
 
-    const AsciiFace* face = nullptr;
-    const char* emotion = current_emotion_.c_str();
+    const char* emotion = ResolveEmotionToShow();
+    auto emoji_collection = static_cast<LvglTheme*>(current_theme_)->emoji_collection();
+    const LvglImage* image = emoji_collection != nullptr ? emoji_collection->GetEmojiImage(emotion) : nullptr;
+
+    if (image != nullptr) {
+        ShowEmotionImage(image);
+    } else {
+        ShowEmotionIcon(emotion);
+    }
+
     DeviceState state = Application::GetInstance().GetDeviceState();
-
-    if (strcmp(emotion, "neutral") != 0) {
-        face = LookupEmotionFace(emotion);
-    }
-    if (face == nullptr) {
-        face = GetStateOverlayFace(state, face_anim_frame_);
-    }
-    if (face == nullptr) {
-        face = &kNeutralFace;
-    }
-
-    lv_label_set_text(face_label_, FormatAsciiFace(*face).c_str());
-
-    if (StateNeedsAnimation(state) && strcmp(emotion, "neutral") == 0) {
+    if (StateNeedsAnimation(state) && strcmp(current_emotion_.c_str(), "neutral") == 0) {
         if (face_anim_timer_ == nullptr) {
             StartFaceAnimation();
         }
@@ -397,14 +399,14 @@ void OledDisplay::RenderAsciiFaceUnlocked() {
     }
 }
 
-void OledDisplay::RenderAsciiFace() {
+void OledDisplay::RenderEmotionFace() {
     DisplayLockGuard lock(this);
-    RenderAsciiFaceUnlocked();
+    RenderEmotionFaceUnlocked();
 }
 
 void OledDisplay::SetStatus(const char* status) {
     (void)status;
-    RenderAsciiFace();
+    RenderEmotionFace();
 }
 
 void OledDisplay::ShowNotification(const char* notification, int duration_ms) {
@@ -647,7 +649,7 @@ void OledDisplay::SetEmotion(const char* emotion) {
     } else {
         current_emotion_ = "neutral";
     }
-    RenderAsciiFace();
+    RenderEmotionFace();
     return;
 #endif
     const char* utf8 = font_awesome_get_utf8(emotion);

@@ -2,11 +2,13 @@
 #define OLED_DISPLAY_H
 
 #include "lvgl_display.h"
+#include "gif/lvgl_gif.h"
 
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_timer.h>
 
+#include <memory>
 #include <string>
 
 
@@ -26,14 +28,19 @@ private:
     lv_obj_t* chat_message_label_ = nullptr;
 
 #if CONFIG_OLED_ASCII_FACE_128X64
-    lv_obj_t* face_label_ = nullptr;
+    lv_obj_t* face_image_ = nullptr;
+    lv_obj_t* face_icon_label_ = nullptr;
+    std::unique_ptr<LvglGif> face_gif_controller_ = nullptr;
     std::string current_emotion_ = "neutral";
     int face_anim_frame_ = 0;
     esp_timer_handle_t face_anim_timer_ = nullptr;
 
     void SetupUI_128x64_AsciiFace();
-    void RenderAsciiFace();
-    void RenderAsciiFaceUnlocked();
+    void RenderEmotionFace();
+    void RenderEmotionFaceUnlocked();
+    void ShowEmotionImage(const LvglImage* image);
+    void ShowEmotionIcon(const char* emotion);
+    const char* ResolveEmotionToShow() const;
     void StartFaceAnimation();
     void StopFaceAnimation();
     static void FaceAnimTimerCallback(void* arg);
